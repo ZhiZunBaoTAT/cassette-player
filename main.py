@@ -10,8 +10,14 @@
 import sys        # 系统相关，获取平台信息
 import os          # 文件路径操作
 import math        # 数学函数（sin/cos 用于旋转角度）
-import random      # 随机数（频谱动画用）
+import random      # 随机数（频谱回退时使用）
+import threading   # 后台线程（异步 PCM 解码）
 from pathlib import Path  # 面向对象的文件路径处理
+
+# ── 科学计算（FFT 音频频谱分析）───────────────
+import numpy as np                          # PCM 数组 + numpy.fft.rfft
+from scipy.fft import rfft, rfftfreq        # 实数 FFT + 频率轴
+from pydub import AudioSegment              # 音频解码（通过 ffmpeg）
 
 # ── PyQt6 GUI 组件 ────────────────────────────
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget,
@@ -32,6 +38,194 @@ from mutagen.mp3 import MP3
 
 
 # ============================================================
+#  频谱解码器 — 后台解码 PCM + FFT 频谱分析
+# ============================================================
+
+class SpectrumDecoder:
+    """后台解码音频文件为 PCM，按播放位置返回 FFT 频谱柱高度。
+
+       保持 QMediaPlayer 不变，用 pydub/ffmpeg 将同一文件解码为
+       mono float32 PCM 数组。_tick() 通过 QMediaPlayer.position()
+       定位采样点 → 加窗 → FFT → 对数频率映射 → 返回柱高列表。
+    """
+
+    def __init__(self, fft_size=1024, target_rate=22050):
+        self._fft_size = fft_size              # FFT 窗口大小（采样点数）
+        self._target_rate = target_rate         # 目标采样率（降采样节省内存）
+        self._pcm = None                        # np.ndarray: mono float32
+        self._sample_rate = 0                   # 实际采样率（Hz）
+        self._total_samples = 0                 # PCM 总采样点数
+        self._ready = False                     # 解码完成标志（线程安全）
+        self._current_file = None               # 已解码的文件路径
+        self._lock = threading.Lock()           # 保护状态切换
+        # ── 预计算结构（延迟初始化）───────────
+        self._window = None                     # Hann 窗系数
+        self._bin_map = None                    # FFT bin → bar 索引
+        self._bin_counts = None                 # 每根 bar 对应的 bin 数量
+        self._bar_count = 0                     # 当前 bin_map 对应的柱数
+
+    # ── 公开属性 ────────────────────────────
+    @property
+    def ready(self):
+        """True 表示 PCM 已解码完毕，可以取频谱"""
+        return self._ready
+
+    def is_current(self, filepath):
+        """已缓存的 PCM 是否对应此文件"""
+        return self._current_file == filepath
+
+    def reset(self):
+        """清空 PCM 缓存，释放内存"""
+        with self._lock:
+            self._pcm = None
+            self._sample_rate = 0
+            self._total_samples = 0
+            self._ready = False
+            self._current_file = None
+            self._window = None
+            self._bin_map = None
+            self._bin_counts = None
+            self._bar_count = 0
+
+    # ── 异步解码入口 ────────────────────────
+    def load_async(self, filepath):
+        """在后台线程中解码音频文件。非阻塞。"""
+        if self.is_current(filepath) and self._ready:
+            return  # 已缓存，无需重新解码
+        self.reset()
+        t = threading.Thread(target=self._load, args=(filepath,), daemon=True)
+        t.start()
+
+    # ── 实际解码（在后台线程中运行）─────────
+    def _load(self, filepath):
+        """pydub 解码 → mono → float32 → 存为 self._pcm"""
+        try:
+            audio = AudioSegment.from_file(filepath)
+            # 降采样节省内存（22050Hz 对频谱可视化完全足够）
+            if audio.frame_rate > self._target_rate:
+                audio = audio.set_frame_rate(self._target_rate)
+            audio = audio.set_channels(1)          # 单声道
+            sr = audio.frame_rate
+            # int16 → float32 归一化到 [-1, 1]
+            samples = np.array(audio.get_array_of_samples(), dtype=np.float32)
+            max_val = float(2 ** (audio.sample_width * 8 - 1))
+            samples /= max_val
+            with self._lock:
+                self._pcm = samples
+                self._sample_rate = sr
+                self._total_samples = len(samples)
+                self._current_file = filepath
+                self._ready = True
+                # Hann 窗（延迟初始化）
+                if self._window is None or len(self._window) != self._fft_size:
+                    self._window = np.hanning(self._fft_size).astype(np.float32)
+        except Exception as e:
+            print(f"[SpectrumDecoder] 解码失败: {filepath} — {e}")
+
+    # ── 频谱查询（UI 线程调用）──────────────
+    def get_spectrum(self, position_ms, bar_count):
+        """取当前播放位置附近的 FFT 频谱，映射为 bar_count 根柱的高度 (0~1)。
+
+           返回 list[float] 或 None（尚未就绪时）。
+        """
+        if not self._ready or self._pcm is None:
+            return None
+        if bar_count < 1:
+            return None
+
+        # 首次调用或柱数变化时重建 bin → bar 映射
+        if self._bin_map is None or self._bar_count != bar_count:
+            self._build_bin_map(bar_count)
+
+        sr = self._sample_rate
+        total = self._total_samples
+        fft_n = self._fft_size
+
+        # 位置 → 采样索引
+        idx = int(position_ms / 1000.0 * sr)
+        idx = max(0, min(idx, total - fft_n))
+
+        # 提取窗口（末尾不足时零填充）
+        if idx + fft_n <= total:
+            window = self._pcm[idx:idx + fft_n] * self._window
+        else:
+            window = np.zeros(fft_n, dtype=np.float32)
+            avail = total - idx
+            window[:avail] = self._pcm[idx:total] * self._window[:avail]
+
+        # FFT → 幅度谱
+        mag = np.abs(rfft(window))
+        # 按预计算映射聚合到柱
+        bar_sums = np.bincount(self._bin_map, weights=mag,
+                               minlength=bar_count)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            bars = bar_sums / np.maximum(self._bin_counts, 1)
+        # sqrt 压缩动态范围
+        bars = np.sqrt(bars)
+        # 归一化到 [0.05, 1.0]
+        max_val = bars.max()
+        if max_val > 0:
+            bars = bars / max_val
+        bars = np.clip(bars, 0.05, 1.0)
+        return bars.tolist()
+
+    def get_waveform(self, position_ms, sample_count):
+        """返回当前位置附近的原始 PCM 采样点（时域波形用）。
+
+           返回 list[float] 或 None（解码未就绪时）。
+        """
+        if not self._ready or self._pcm is None:
+            return None
+        sr = self._sample_rate
+        total = self._total_samples
+        idx = int(position_ms / 1000.0 * sr)
+        start = max(0, idx - sample_count // 2)
+        end = min(total, start + sample_count)
+        chunk = self._pcm[start:end]
+        # 不足时零填充
+        if len(chunk) < sample_count:
+            padded = np.zeros(sample_count, dtype=np.float32)
+            padded[:len(chunk)] = chunk
+            return padded.tolist()
+        return chunk.tolist()
+
+    # ── 预计算 FFT bin → bar 映射（对数频率）─
+    def _build_bin_map(self, bar_count):
+        """按对数频率刻度将 FFT bin 分配到 bar。
+
+           频率范围 30Hz ~ min(Nyquist, 10kHz)，低频柱分到更多 bin，
+           更符合人耳对低频的感知。
+        """
+        sr = self._sample_rate
+        fft_n = self._fft_size
+        freqs = rfftfreq(fft_n, 1.0 / sr)          # 每个正频率 bin 的中心频率
+        n_bins = len(freqs)
+
+        min_freq = 30.0
+        max_freq = min(sr / 2.0, 10000.0)
+        # 对数等间距切分 bar_count 段
+        log_min = np.log10(min_freq)
+        log_max = np.log10(max_freq)
+        edges = np.logspace(log_min, log_max, bar_count + 1)
+
+        bin_map = np.zeros(n_bins, dtype=np.int32)
+        bin_counts = np.zeros(bar_count, dtype=np.int32)
+        for bi in range(n_bins):
+            f = freqs[bi]
+            # 二分查找 f 落在哪个柱区间
+            bar_idx = np.searchsorted(edges, f) - 1
+            bar_idx = max(0, min(bar_idx, bar_count - 1))
+            bin_map[bi] = bar_idx
+            bin_counts[bar_idx] += 1
+        # 确保每柱至少 1 个 bin（避免除零）
+        bin_counts = np.maximum(bin_counts, 1)
+
+        self._bin_map = bin_map
+        self._bin_counts = bin_counts
+        self._bar_count = bar_count
+
+
+# ============================================================
 #  音频引擎 — 负责所有音频播放逻辑（独立于 UI）
 # ============================================================
 
@@ -45,6 +239,9 @@ class AudioEngine:
         self._player.setAudioOutput(self._audio) # 绑定输出
         self._audio.setVolume(0.8)               # 默认音量 80%
 
+        # ── 频谱解码器（后台 PCM 解码 + FFT）──
+        self._decoder = SpectrumDecoder(fft_size=1024, target_rate=22050)
+
         # ── 播放列表状态 ──
         self._playlist = []   # 歌曲路径列表
         self._index = -1      # 当前播放索引（-1 = 无）
@@ -56,6 +253,25 @@ class AudioEngine:
     def _on_state_change(self, state):
         """Qt 播放状态变化时更新内部标志"""
         self._playing = (state == QMediaPlayer.PlaybackState.PlayingState)
+
+    # ── 频谱代理（委托给 SpectrumDecoder）─────
+    @property
+    def decoder_ready(self):
+        """PCM 解码是否已完成"""
+        return self._decoder.ready
+
+    def get_spectrum(self, position_ms, bar_count):
+        """获取当前播放位置的 FFT 频谱柱高列表"""
+        return self._decoder.get_spectrum(position_ms, bar_count)
+
+    def _start_decode(self, filepath):
+        """后台异步解码音频文件为 PCM（非阻塞）"""
+        if not self._decoder.is_current(filepath):
+            self._decoder.load_async(filepath)
+
+    def cleanup(self):
+        """释放 PCM 缓存内存"""
+        self._decoder.reset()
 
     # ── 属性（只读）────────────────────────────
     @property
@@ -102,6 +318,7 @@ class AudioEngine:
             self._player.play()
             self._playing = True
             self._index = index
+            self._start_decode(path)             # 后台解码 PCM → FFT 频谱用
             return True
         return False
 
@@ -164,10 +381,14 @@ class CassettePlayer(QWidget):
         self.rotation_angle = 0.0               # 磁带轮旋转角度（度）
         self._settings = QSettings("CassettePlayer", "CassettePlayer")  # 持久化存储
 
+        # ── 可视化风格（0-5莫兰迪 6-11彩虹，%6得样式 //6得配色）──
+        self._viz_style = int(self._settings.value("viz_style", 0))
+
         # ── 频谱柱数据（预分配容量，实际数量由布局决定）──
         self._bar_count = 60                    # 柱子上限
         self._bars = [0.05] * self._bar_count   # 当前高度（0~1）
         self._bar_targets = [0.05] * self._bar_count  # 目标高度
+        self._particles = []                    # 粒子状态（风格 4 延迟初始化）
         self._bar_frame = 0                     # 动画帧计数
         self._hue_offset = 0.0                  # 色相偏移（流动彩虹）
         self._drag_start = None                 # 拖拽起始坐标
@@ -230,13 +451,20 @@ class CassettePlayer(QWidget):
             # ── 播放中：磁带轮旋转 + 频谱跳动 ──
             self.rotation_angle += 3.0         # 每帧旋转 3°（约 100°/秒）
             self._bar_frame += 1               # 帧计数器递增
-            if self._bar_frame % 4 == 0:       # 每 4 帧（~120ms）更新一批
-                n = self._bar_count
-                for i in range(0, n, 3):       # 步长 3，分批更新
-                    # random.uniform(a, b)：生成 a~b 间随机浮点数
-                    self._bar_targets[i] = random.uniform(0.2, 1.0)        # 主柱：较高
-                    self._bar_targets[min(i + 1, n - 1)] = random.uniform(0.12, 0.65)  # 邻柱：中等
-                    self._bar_targets[min(i + 2, n - 1)] = random.uniform(0.05, 0.35)  # 次邻：矮
+
+            # 优先使用真实 FFT 频谱，解码未完成时回退到随机
+            if self.audio.decoder_ready:
+                spectrum = self.audio.get_spectrum(
+                    self.audio.position(), self._bar_count)
+                if spectrum is not None:
+                    for i in range(self._bar_count):
+                        self._bar_targets[i] = spectrum[i]
+                else:
+                    self._random_bars()
+            else:
+                # 后台解码中（通常 < 1 秒），沿用旧随机逻辑
+                if self._bar_frame % 4 == 0:
+                    self._random_bars()
         else:
             # ── 暂停中：所有柱子缓慢衰减到接近 0 ──
             for i in range(self._bar_count):
@@ -250,6 +478,14 @@ class CassettePlayer(QWidget):
         self._hue_offset = (self._hue_offset + 0.003) % 1.0
 
         self.update()  # 触发 paintEvent 重绘
+
+    def _random_bars(self):
+        """随机柱高（解码未完成时的回退方案）"""
+        n = self._bar_count
+        for i in range(0, n, 3):
+            self._bar_targets[i] = random.uniform(0.2, 1.0)
+            self._bar_targets[min(i + 1, n - 1)] = random.uniform(0.12, 0.65)
+            self._bar_targets[min(i + 2, n - 1)] = random.uniform(0.05, 0.35)
 
     # ================================================================
     #  绘制 — paintEvent 在 update() 或窗口变化时自动调用
@@ -347,15 +583,15 @@ class CassettePlayer(QWidget):
         hl_global = _rounded_trapezoid(tl_x, tr_x, bl_x, br_x, top_y, bottom_y, cr)
         p.fillPath(hl_global, grad)
 
-        # ⑤ 标签装饰横线（两条淡色线）
-        p.setPen(QPen(QColor(200, 190, 160, 50), 1))
+        # ⑤ 标签装饰横线（两条淡色线，矢量缩放）
+        p.setPen(QPen(QColor(200, 190, 160, 50), max(1, int(1 * s))))
         for i in range(2):
-            ly = top_y + 22 + i * 20
-            p.drawLine(int(bl_x + 16), ly, int(br_x - 16), ly)
+            ly = top_y + int(22 * s) + i * int(20 * s)
+            p.drawLine(int(bl_x + int(16 * s)), ly, int(br_x - int(16 * s)), ly)
 
         # ⑥ 绘制歌曲信息文字（融入标签区）
-        font_s = max(10, int(14 * s))              # 歌名字体大小
-        artist_font_s = max(8, int(11 * s))        # 艺术家字体大小
+        font_s = max(12, int(16 * s))              # 歌名字体大小
+        artist_font_s = max(10, int(13 * s))        # 艺术家字体大小
         label_cx = (tl_x + tr_x) / 2               # 标签水平中心
 
         # ── 歌名 ──
@@ -363,14 +599,14 @@ class CassettePlayer(QWidget):
         title_font.setBold(True)
         p.setFont(title_font)
         p.setPen(QColor(240, 235, 220, 220))       # 暖白色
-        title_rect = QRectF(tl_x + 10, top_y + 4, tr_x - tl_x - 20, 24 * s)
+        title_rect = QRectF(tl_x + 10, top_y + int(3 * s) + 4, tr_x - tl_x - 20, 24 * s)
         p.drawText(title_rect, Qt.AlignmentFlag.AlignCenter, self._track_title)
 
         # ── 艺术家 ──
         artist_font = QFont("Microsoft YaHei", artist_font_s)
         p.setFont(artist_font)
         p.setPen(QColor(200, 190, 170, 180))       # 淡暖色
-        artist_rect = QRectF(tl_x + 10, top_y + 28 * s, tr_x - tl_x - 20, 20 * s)
+        artist_rect = QRectF(tl_x + 10, top_y + int(3 * s) + 28 * s, tr_x - tl_x - 20, 20 * s)
         p.drawText(artist_rect, Qt.AlignmentFlag.AlignCenter, self._track_artist)
 
         # ── 磁带轮（左右两个旋转轮盘）───────────
@@ -410,12 +646,13 @@ class CassettePlayer(QWidget):
 
         # ── 四角螺丝 ────────────────────────────
         screw_r = int(7 * s)                       # 螺丝外圈半径
-        screw_off = int(14 * s)                    # 螺丝距边缘偏移
+        top_off = int(18 * s)                      # 上方螺丝距边缘（不挡标签）
+        bot_off = int(26 * s)                      # 下方螺丝距边缘（内移）
         screw_positions = [
-            (margin + screw_off, margin + screw_off),                     # 左上：+
-            (w - margin - screw_off, margin + screw_off),                 # 右上：✕
-            (margin + screw_off, cassette_bottom - screw_off),            # 左下：一字槽
-            (w - margin - screw_off, cassette_bottom - screw_off),        # 右下：一字槽
+            (margin + top_off, margin + top_off + int(7 * s)),               # 左上：+
+            (w - margin - top_off, margin + top_off + int(7 * s)),           # 右上：✕
+            (margin + bot_off + int(2 * s), cassette_bottom - bot_off + int(2 * s)), # 左下：V
+            (w - margin - bot_off - int(2 * s), cassette_bottom - bot_off + int(2 * s)), # 右下：一字槽
         ]
         self._screw_positions = screw_positions     # 存储 → 供点击检测
 
@@ -439,7 +676,12 @@ class CassettePlayer(QWidget):
                 d = int(2 * s)
                 p.drawLine(int(sx - d), int(sy - d), int(sx + d), int(sy + d))  # 对角线
                 p.drawLine(int(sx + d), int(sy - d), int(sx - d), int(sy + d))  # 反对角线
-            else:                                  # 左下/右下：一字槽
+            elif idx == 2:                         # 左下：V 字形（visualization）
+                p.setPen(QPen(QColor(255, 90, 100, 200), max(1, lw)))
+                d = int(3 * s)
+                p.drawLine(int(sx - d), int(sy - d), int(sx), int(sy + d))
+                p.drawLine(int(sx + d), int(sy - d), int(sx), int(sy + d))
+            else:                                  # 右下：一字槽（暗色）
                 p.setPen(QPen(QColor(100, 105, 115, 150), 1))
                 p.drawLine(int(sx - d), int(sy), int(sx + d), int(sy))
                 p.drawLine(int(sx), int(sy - d), int(sx), int(sy + d))
@@ -456,8 +698,8 @@ class CassettePlayer(QWidget):
         dur = self.audio.duration()
         pos_ms = self.audio.position()
 
-        # ── 进度条 Y 坐标 ────────────────────────
-        progress_y = cassette_bottom - waveform_base_offset - waveform_max_h - int(10 * s)
+        # ── 进度条 Y 坐标（音浪上方留出间隙）────
+        progress_y = cassette_bottom - waveform_base_offset - waveform_max_h - int(24 * s)
 
         # ── 时间标签 ────────────────────────────
         def _fmt(ms):
@@ -506,66 +748,277 @@ class CassettePlayer(QWidget):
         if dur > 0 and pos_ms >= 0:
             dot_x = progress_rect.x() + progress_rect.width() * frac
             dot_y = progress_rect.center().y()
-            heart_font = QFont("Segoe UI Emoji", max(8, int(11 * s)))
+            heart_font = QFont("Segoe UI Emoji", max(16, int(24 * s)))
             p.setFont(heart_font)
             p.setPen(QColor(255, 100, 130, 240))
-            p.drawText(QRectF(dot_x - int(10 * s), dot_y - int(10 * s),
-                              int(20 * s), int(20 * s)),
+            p.drawText(QRectF(dot_x - int(20 * s), dot_y - int(23 * s),
+                              int(40 * s), int(40 * s)),
                        Qt.AlignmentFlag.AlignCenter, "❤")
 
         # ── 频谱音浪（磁带机身内部底部）───────────
-        bar_count = min(60, len(self._bars))
-        self._bar_count = bar_count
-        cell_w = wave_total_w / bar_count
-        bar_w = max(2.0, cell_w * 0.7)
-        bar_gap = cell_w - bar_w
-
         base_y = cassette_bottom - waveform_base_offset
         max_bar_h = waveform_max_h
+        self._draw_spectrum(p, wave_start_x, wave_end_x, base_y, max_bar_h, s)
 
-        p.setPen(Qt.PenStyle.NoPen)                # 以下全部无边框
-        for i in range(self._bar_count):
-            t = self._bars[i]                      # 当前高度比例（0~1）
-            bar_h = max(2, int(t * max_bar_h))     # 实际像素高度
-            bx = wave_start_x + i * cell_w         # 柱子左边缘 X
-            by = base_y - bar_h                    # 柱子顶部 Y（从基线向上）
+    # ================================================================
+    #  频谱可视化 — 6 种风格（由 _viz_style 选择）
+    # ================================================================
 
-            # ── HSV → RGB 颜色计算 ────────────
-            # 色相 = 位置 + 时间偏移 → 流动彩虹
-            hue = (i / self._bar_count + self._hue_offset) % 1.0
-            sat = 1.0                              # 全饱和
-            val = 0.75 + t * 0.25                  # 亮度随高度增强
+    def _morandi_color(self, i, t, bar_count):
+        """莫兰迪调色板：低饱和高级灰，亮度随柱高变化"""
+        palette = [
+            (185, 150, 145),  # 灰粉
+            (200, 180, 165),  # 灰杏
+            (155, 170, 150),  # 灰绿
+            (145, 155, 175),  # 灰蓝
+            (170, 165, 180),  # 灰紫
+            (180, 160, 155),  # 灰玫
+            (160, 170, 170),  # 灰青
+            (190, 175, 160),  # 灰驼
+        ]
+        # 按位置循环取色，加上时间偏移使颜色缓慢流动
+        idx = int((i / bar_count * len(palette) + self._hue_offset * len(palette)) % len(palette))
+        br, bg, bb = palette[idx]
+        # 亮度随柱高增强
+        scale = 0.6 + t * 0.4
+        r = min(255, int(br * scale))
+        g = min(255, int(bg * scale))
+        b = min(255, int(bb * scale))
+        return QColor(r, g, b)
 
-            chroma = val * sat                     # 色度
-            h6 = hue * 6                           # 色相 × 6（映射到 6 段）
-            hx = chroma * (1 - abs(h6 % 2 - 1))   # 中间量
-            cm = val - chroma                      # 亮度补偿
+    def _rainbow_color(self, i, t, bar_count):
+        """HSV 彩虹：色相按位置+时间偏移流动"""
+        hue = (i / bar_count + self._hue_offset) % 1.0
+        val = 0.65 + t * 0.35
+        chroma = val
+        h6 = hue * 6
+        hx = chroma * (1 - abs(h6 % 2 - 1))
+        cm = val - chroma
+        if h6 < 1:       rf, gf, bf = chroma, hx, 0
+        elif h6 < 2:     rf, gf, bf = hx, chroma, 0
+        elif h6 < 3:     rf, gf, bf = 0, chroma, hx
+        elif h6 < 4:     rf, gf, bf = 0, hx, chroma
+        elif h6 < 5:     rf, gf, bf = hx, 0, chroma
+        else:            rf, gf, bf = chroma, 0, hx
+        r = int((rf + cm) * 255)
+        g = int((gf + cm) * 255)
+        b = int((bf + cm) * 255)
+        return QColor(r, g, b)
 
-            # 根据 h6 的整数部分确定 RGB 分量
-            if h6 < 1:       rf, gf, bf = chroma, hx, 0
-            elif h6 < 2:     rf, gf, bf = hx, chroma, 0
-            elif h6 < 3:     rf, gf, bf = 0, chroma, hx
-            elif h6 < 4:     rf, gf, bf = 0, hx, chroma
-            elif h6 < 5:     rf, gf, bf = hx, 0, chroma
-            else:            rf, gf, bf = chroma, 0, hx
+    def _bar_color(self, i, t, bar_count):
+        """根据当前配色方案分发"""
+        if self._viz_style < 6:
+            return self._morandi_color(i, t, bar_count)
+        else:
+            return self._rainbow_color(i, t, bar_count)
 
-            r = int((rf + cm) * 255)               # 红色通道
-            g = int((gf + cm) * 255)               # 绿色通道
-            b = int((bf + cm) * 255)               # 蓝色通道
+    def _draw_spectrum(self, p, sx, ex, base_y, max_h, s):
+        """根据 _viz_style 分发到对应绘制方法"""
+        total_w = ex - sx
+        bar_count = min(60, len(self._bars))
+        self._bar_count = bar_count
 
-            # ── 三层绘制（炫光效果）───────────
-            # ① 外层炫光：宽 6px，极其透明（alpha=30）
-            p.setBrush(QColor(r, g, b, 30))
-            p.drawRoundedRect(QRectF(bx - 3, by - 6, bar_w + 6, bar_h + 10), 6, 6)
-            # ② 中层光晕：宽 2px，半透明（alpha=80）
-            p.setBrush(QColor(r, g, b, 80))
-            p.drawRoundedRect(QRectF(bx - 1, by - 3, bar_w + 2, bar_h + 5), 4, 4)
-            # ③ 主体色柱：原宽度，高不透明（alpha=240）
-            p.setBrush(QColor(r, g, b, 240))
-            p.drawRoundedRect(QRectF(bx, by, bar_w, bar_h), 2, 2)
-            # ④ 顶部高亮：柱顶 25% 部分额外增亮
-            p.setBrush(QColor(min(r + 80, 255), min(g + 80, 255), min(b + 80, 255), 200))
-            p.drawRoundedRect(QRectF(bx, by, bar_w, max(3, int(bar_h * 0.25))), 2, 2)
+        # ── 清除上一帧残留 ────────────────────
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(55, 60, 72, 110))
+        p.drawRect(QRectF(sx, base_y - max_h, total_w, max_h))
+
+        styles = [
+            self._draw_bars,
+            self._draw_radar,
+            self._draw_waveform,
+            self._draw_mirror,
+            self._draw_particles,
+            self._draw_pulse,
+        ]
+        styles[self._viz_style % 6](p, sx, ex, base_y, max_h, s, bar_count, total_w)
+
+    # ── 风格 0：柱状频谱（经典）─────────────
+    def _draw_bars(self, p, sx, ex, base_y, max_h, s, n, tw):
+        cell_w = tw / n
+        bar_w = max(2.0, cell_w * 0.7)
+        p.setPen(Qt.PenStyle.NoPen)
+        for i in range(n):
+            t = self._bars[i]
+            bh = max(2, int(t * max_h))
+            bx = sx + i * cell_w
+            by = base_y - bh
+            c = self._bar_color(i, t, n)
+            # 四层炫光
+            p.setBrush(QColor(c.red(), c.green(), c.blue(), 30))
+            p.drawRoundedRect(QRectF(bx - 3, by - 6, bar_w + 6, bh + 10), 6, 6)
+            p.setBrush(QColor(c.red(), c.green(), c.blue(), 80))
+            p.drawRoundedRect(QRectF(bx - 1, by - 3, bar_w + 2, bh + 5), 4, 4)
+            p.setBrush(QColor(c.red(), c.green(), c.blue(), 240))
+            p.drawRoundedRect(QRectF(bx, by, bar_w, bh), 2, 2)
+            p.setBrush(QColor(min(c.red() + 80, 255),
+                              min(c.green() + 80, 255),
+                              min(c.blue() + 80, 255), 200))
+            p.drawRoundedRect(QRectF(bx, by, bar_w, max(3, int(bh * 0.25))), 2, 2)
+
+    # ── 风格 1：圆形雷达 ─────────────────────
+    def _draw_radar(self, p, sx, ex, base_y, max_h, s, n, tw):
+        cx = (sx + ex) / 2
+        cy = base_y - max_h / 2 - int(10 * s) # 上提，避免溢出底部
+        max_r = min(tw, max_h) / 2 + int(2 * s)
+        inner_r = max_r * 0.05
+        angle_step = 2 * math.pi / n
+        p.setPen(Qt.PenStyle.NoPen)
+        for i in range(n):
+            t = self._bars[i]
+            bar_len = int(inner_r + t * (max_r - inner_r))
+            a = i * angle_step - math.pi / 2
+            bx = cx + math.cos(a) * inner_r
+            by = cy + math.sin(a) * inner_r
+            ex2 = cx + math.cos(a) * bar_len
+            ey2 = cy + math.sin(a) * bar_len
+            c = self._bar_color(i, t, n)
+            bw = max(1.5, tw / n * 0.55)
+            # 光晕
+            p.setBrush(QColor(c.red(), c.green(), c.blue(), 50))
+            p.drawEllipse(QPointF(ex2, ey2), bw + 4, bw + 4)
+            # 主体线
+            pen = QPen(QColor(c.red(), c.green(), c.blue(), 230), bw)
+            p.setPen(pen)
+            p.drawLine(QPointF(bx, by), QPointF(ex2, ey2))
+            p.setPen(Qt.PenStyle.NoPen)
+        # 中心点
+        p.setBrush(QColor(220, 220, 240, 200))
+        p.drawEllipse(QPointF(cx, cy), 1, 1)
+
+    # ── 风格 2：波形曲线（炫彩时域）───────────
+    def _draw_waveform(self, p, sx, ex, base_y, max_h, s, n, tw):
+        cy = base_y - max_h / 2
+        half_h = max_h / 2
+        sample_count = max(200, int(tw))
+        samples = self.audio._decoder.get_waveform(
+            self.audio.position(), sample_count)
+        if samples is None or len(samples) < 2:
+            return
+        pts = []
+        for i, v in enumerate(samples[:sample_count]):
+            x = sx + i * tw / (sample_count - 1)
+            y = cy - v * half_h * 0.9
+            pts.append(QPointF(x, y))
+        # 波形填充（半透明彩虹底）
+        path = QPainterPath()
+        path.moveTo(pts[0].x(), cy)
+        for pt in pts:
+            path.lineTo(pt)
+        path.lineTo(pts[-1].x(), cy)
+        path.closeSubpath()
+        mid_c = self._bar_color(n // 2, 0.6, 1)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(mid_c.red(), mid_c.green(), mid_c.blue(), 25))
+        p.drawPath(path)
+        # 描边：每段使用当前配色
+        seg_count = len(pts) - 1
+        for i in range(seg_count):
+            seg_c = self._bar_color(i, 0.7, seg_count)
+            pen = QPen(QColor(seg_c.red(), seg_c.green(), seg_c.blue(), 220),
+                       max(1.5, 2.5 * s))
+            p.setPen(pen)
+            p.drawLine(pts[i], pts[i + 1])
+
+    # ── 风格 3：镜像对称柱状 ─────────────────
+    def _draw_mirror(self, p, sx, ex, base_y, max_h, s, n, tw):
+        cy = base_y - max_h / 2
+        half_h = max_h / 2 - int(3 * s)
+        cell_w = tw / n
+        bar_w = max(2 * s, cell_w * 0.65)
+        p.setPen(Qt.PenStyle.NoPen)
+        for i in range(n):
+            t = self._bars[i]
+            bh = max(2 * s, int(t * half_h))
+            bx = sx + i * cell_w
+            c = self._bar_color(i, t, n)
+            # 上半
+            p.setBrush(QColor(c.red(), c.green(), c.blue(), 200))
+            p.drawRoundedRect(QRectF(bx, cy - bh, bar_w, bh), 1, 1)
+            p.setBrush(QColor(min(c.red() + 60, 255),
+                              min(c.green() + 60, 255),
+                              min(c.blue() + 60, 255), 140))
+            p.drawRoundedRect(QRectF(bx, cy - bh, bar_w, max(2 * s, int(bh * 0.3))), 1, 1)
+            # 下半（镜像）
+            p.setBrush(QColor(c.red(), c.green(), c.blue(), 120))
+            p.drawRoundedRect(QRectF(bx, cy, bar_w, bh), 1, 1)
+        # 中缝横线
+        p.setPen(QPen(QColor(255, 255, 255, 40), 1))
+        p.drawLine(QPointF(sx, cy), QPointF(ex, cy))
+
+    # ── 风格 4：粒子漂浮 ─────────────────────
+    def _draw_particles(self, p, sx, ex, base_y, max_h, s, n, tw):
+        cy = base_y - max_h / 2
+        half_h = max_h / 2 - int(6 * s)
+        # 窗口缩放或首次初始化时重建粒子
+        if (not hasattr(self, '_particles') or len(self._particles) != 40
+                or getattr(self, '_particles_tw', 0) != tw):
+            self._particles = []
+            self._particles_tw = tw
+            import random as _rnd
+            for _ in range(40):
+                self._particles.append({
+                    'frac': _rnd.random(),          # 用比例代替绝对坐标
+                    'y': cy,
+                    'target_y': cy,
+                    'size': _rnd.uniform(2, 5) * s,
+                    'hue': _rnd.random(),
+                })
+        p.setPen(Qt.PenStyle.NoPen)
+        for pi, pt in enumerate(self._particles):
+            # 根据 frac 还原当前 x 坐标
+            px = sx + pt['frac'] * tw
+            bi = max(0, min(n - 1, int(pt['frac'] * n)))
+            t = self._bars[bi]
+            pt['target_y'] = cy - t * half_h * (1.0 if (pi % 2) else -1.0)
+            pt['y'] += (pt['target_y'] - pt['y']) * 0.12
+            pt['hue'] = (pt['hue'] + random.uniform(0, 0.01)) % 1.0
+            pt['size'] = max(2 * s, (3 + t * 4) * s)
+            # 光晕
+            c = self._bar_color(bi, t, n)
+            sz = pt['size']
+            p.setBrush(QColor(c.red(), c.green(), c.blue(), 40))
+            p.drawEllipse(QPointF(px, pt['y']), sz + 2 * s, sz + 2 * s)
+            p.setBrush(QColor(c.red(), c.green(), c.blue(), 220))
+            p.drawEllipse(QPointF(px, pt['y']), sz, sz)
+
+    # ── 风格 5：圆环脉冲 ─────────────────────
+    def _draw_pulse(self, p, sx, ex, base_y, max_h, s, n, tw):
+        cx = (sx + ex) / 2
+        cy = base_y - max_h / 2 - int(10 * s) # 上提，与雷达同步
+        max_r = min(tw, max_h) / 2 + int(2 * s)
+        # 低频/中频/高频能量
+        bass = sum(self._bars[:10]) / 10
+        mid = sum(self._bars[10:30]) / 20
+        high = sum(self._bars[30:]) / max(1, n - 30)
+        rings = [
+            (0.25 * max_r, bass, self._bar_color(0, 0.8, n)),     # 内圈
+            (0.55 * max_r, mid, self._bar_color(n // 3, 0.7, n)),  # 中圈
+            (0.85 * max_r, high, self._bar_color(n * 2 // 3, 0.6, n)),  # 外圈
+        ]
+        p.setPen(Qt.PenStyle.NoPen)
+        for base_r, energy, color in rings:
+            r = max(6, int(base_r + energy * max_r * 0.35))
+            # 外光晕
+            p.setBrush(QColor(color.red(), color.green(), color.blue(), 25))
+            p.drawEllipse(QPointF(cx, cy), r + 10, r + 10)
+            # 主体圆环
+            pen = QPen(QColor(color.red(), color.green(), color.blue(),
+                              max(60, color.alpha())), max(2.0, 3.0 * s))
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QPointF(cx, cy), r, r)
+            p.setPen(Qt.PenStyle.NoPen)
+        # 中心脉冲点
+        dot_c = self._bar_color(0, bass, 1)
+        p.setBrush(QColor(dot_c.red(), dot_c.green(), dot_c.blue(),
+                          int(120 + bass * 135)))
+        p.drawEllipse(QPointF(cx, cy), max(1, int(2 + bass * 4)),
+                      max(1, int(2 + bass * 4)))
+
+    # ================================================================
+    #  磁带轮绘制
+    # ================================================================
 
     def _draw_reel(self, p, cx, cy, r):
         """绘制一个磁带轮（含旋转齿轮和中心轴）
@@ -583,15 +1036,32 @@ class CassettePlayer(QWidget):
         p.setBrush(QColor(25, 28, 35, 140))
         p.drawEllipse(QPointF(0, 0), r - 2, r - 2)
 
-        # ③ 5 个旋转齿轮（随 rotation_angle 旋转）
-        angle_rad = math.radians(self.rotation_angle)  # 角度 → 弧度
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(55, 58, 68, 100))
+        # ③ 5 个旋转齿轮（莫兰迪配色）
+        angle_rad = math.radians(self.rotation_angle)
+        morandi = [
+            QColor(185, 150, 145),   # 灰粉
+            QColor(155, 170, 150),   # 灰绿
+            QColor(145, 155, 175),   # 灰蓝
+            QColor(190, 175, 150),   # 灰杏
+            QColor(170, 160, 180),   # 灰紫
+        ]
         for i in range(5):
-            a = math.radians(i * 72) + angle_rad      # 每个齿轮间隔 72°，加上旋转偏移
-            gx = math.cos(a) * (r - 16)               # 齿轮 X = cos(角度) × 半径
-            gy = math.sin(a) * (r - 16)               # 齿轮 Y = sin(角度) × 半径
-            p.drawEllipse(QPointF(gx, gy), 5, 5)      # 小圆齿轮
+            a = math.radians(i * 72) + angle_rad
+            gx = math.cos(a) * (r - 16)
+            gy = math.sin(a) * (r - 16)
+            c = morandi[i]
+            # 阴影
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(c.red(), c.green(), c.blue(), 80))
+            p.drawEllipse(QPointF(gx + 1, gy + 1), 6, 6)
+            # 主体
+            p.setBrush(QColor(c.red(), c.green(), c.blue(), 180))
+            p.drawEllipse(QPointF(gx, gy), 6, 6)
+            # 高光
+            p.setBrush(QColor(min(c.red() + 40, 255),
+                              min(c.green() + 40, 255),
+                              min(c.blue() + 40, 255), 120))
+            p.drawEllipse(QPointF(gx - 1, gy - 2), 3, 3)
 
         # ④ 内环（装饰圈）
         p.setPen(QPen(QColor(90, 100, 120, 100), 1))
@@ -655,6 +1125,12 @@ class CassettePlayer(QWidget):
             self._update_track_info()
             self._btn_play_text = "⏸"
             self.update()
+
+    def _cycle_viz(self):
+        """切换风格+配色（12 种组合）"""
+        self._viz_style = (self._viz_style + 1) % 12
+        self._settings.setValue("viz_style", self._viz_style)
+        self.update()
 
     def _update_track_info(self):
         """根据当前索引更新歌名和艺术家标签"""
@@ -734,30 +1210,32 @@ class CassettePlayer(QWidget):
                     self.audio.seek(int(self.audio.duration() * frac))
                     return
 
-            # ② 功能螺丝（半径 14px 固定值）
+            # ② 角落缩放（优先于螺丝，避免误触）
+            corner = self._corner_at(pos)
+            if corner is not None:
+                self._resize_corner = corner          # 记录哪个角
+                self._resize_start = event.globalPosition().toPoint()  # 鼠标全局坐标
+                self._resize_min = self.window().minimumSize() # 最小尺寸限制
+                g = self.window().geometry()
+                self._resize_ratio = g.width() / g.height()  # 锁定宽高比
+                return
+
+            # ③ 功能螺丝（缩小半径避免干扰拖拽）
             if hasattr(self, '_screw_positions'):
-                r = 14
-                for idx in (0, 1):                   # 只检查左上(+)和右上(✕)
+                r = 10 * (self.width() / 680)         # 响应半径随窗口缩放
+                for idx in (0, 1, 2):                # 左上/右上/左下
                     sx, sy = self._screw_positions[idx]
-                    # 勾股定理算距离
                     dist = ((pos.x() - sx) ** 2 + (pos.y() - sy) ** 2) ** 0.5
                     if dist <= r:
                         if idx == 0:
                             self._open_folder()      # 左上：打开文件夹
-                        else:
+                        elif idx == 1:
                             self.window().close()    # 右上：关闭窗口
-                        return                       # 已处理，不继续
+                        else:
+                            self._cycle_viz()        # 左下：切换可视化风格
+                        return
 
-            # ② 角落缩放
-            corner = self._corner_at(pos)
-            if corner is not None:
-                self._resize_corner = corner          # 记录哪个角
-                self._resize_start = event.globalPosition().toPoint()  # 起始屏幕坐标
-                self._resize_geom = self.window().geometry()   # 起始窗口几何
-                self._resize_min = self.window().minimumSize() # 最小尺寸限制
-                return
-
-            # ③ 否则：开始拖拽
+            # ④ 否则：开始拖拽
             self._drag_start = event.globalPosition().toPoint()
 
     def mouseMoveEvent(self, event):
@@ -773,32 +1251,42 @@ class CassettePlayer(QWidget):
                 self.audio.seek(int(self.audio.duration() * frac))
                 return
 
-        # ── 缩放中 ──
+        # ── 缩放中（增量式，锁定宽高比）──
         if (hasattr(self, '_resize_corner') and self._resize_corner is not None
                 and event.buttons() & Qt.MouseButton.LeftButton):
-            delta = event.globalPosition().toPoint() - self._resize_start
-            g = self._resize_geom
+            new_pos = event.globalPosition().toPoint()
+            delta = new_pos - self._resize_start      # 上一帧到当前的增量
+            g = self.window().geometry()              # 当前窗口几何
             mw, mh = self._resize_min.width(), self._resize_min.height()
-            x, y, w, h = g.x(), g.y(), g.width(), g.height()  # 初始几何
+            ow, oh = g.width(), g.height()            # 原始宽高
             c = self._resize_corner
+            ratio = getattr(self, '_resize_ratio', 680 / 420)
 
-            # 根据角落位置调整对应边
-            if c in (0, 2):                          # 左边角 → 修改左边界 & 宽度
-                nx = g.x() + delta.x()
-                nw = g.width() - delta.x()
-                if nw >= mw:                         # 不低于最小宽度
-                    x = nx; w = nw
-            if c in (1, 3):                          # 右边角 → 修改宽度
-                w = max(mw, g.width() + delta.x())
-            if c in (0, 1):                          # 上边角 → 修改上边界 & 高度
-                ny = g.y() + delta.y()
-                nh = g.height() - delta.y()
-                if nh >= mh:
-                    y = ny; h = nh
-            if c in (2, 3):                          # 下边角 → 修改高度
-                h = max(mh, g.height() + delta.y())
+            # 根据角落计算目标宽高
+            if c in (0, 2):
+                w = max(mw, ow - delta.x())           # 左边角：宽度缩小
+            else:
+                w = max(mw, ow + delta.x())           # 右边角：宽度增大
+            if c in (0, 1):
+                h = max(mh, oh - delta.y())           # 上边角：高度缩小
+            else:
+                h = max(mh, oh + delta.y())           # 下边角：高度增大
 
-            self.window().setGeometry(x, y, w, h)    # 应用新尺寸
+            # 宽高比锁定：取变化大的一方主导
+            if abs(w - ow) > abs(h - oh):
+                h = max(mh, w / ratio)
+            else:
+                w = max(mw, h * ratio)
+
+            # 保持对角固定，计算新位置
+            x, y = g.x(), g.y()
+            if c in (0, 2):                           # 左边角 → 右边界固定
+                x = g.x() + ow - w
+            if c in (0, 1):                           # 上边角 → 下边界固定
+                y = g.y() + oh - h
+
+            self.window().setGeometry(int(x), int(y), int(w), int(h))
+            self._resize_start = new_pos             # 更新参考点
 
         # ── 拖拽中 ──
         elif self._drag_start is not None and event.buttons() & Qt.MouseButton.LeftButton:
@@ -870,7 +1358,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.resize(680, 420)              # 初始窗口尺寸（磁带比例）
+        self.resize(500, 320)              # 启动时最小尺寸
         self.setMinimumSize(500, 320)      # 最小尺寸
 
         # FramelessWindowHint：去掉系统标题栏和边框 → 磁带形状即窗口
