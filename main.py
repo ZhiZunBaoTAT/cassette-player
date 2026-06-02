@@ -489,32 +489,38 @@ class CassettePlayer(QWidget):
             if self._beat_cooldown > 0: self._beat_cooldown -= 1
             self._prev_bass = bass
 
-            # ── 磁带音符粒子 ──
+            # ── 磁带音符粒子：沿贝塞尔弧线从左蹦跳到右 ──
             note_chars = ['♪', '♫', '♩', '♬']
             for note in self._tape_notes:
-                note['y'] += note['vy']
-                note['life'] -= 0.015
-            self._tape_notes = [n for n in self._tape_notes if n['life'] > 0]
-            # 节拍强拍时生成音符
-            if self._beat_boost > 1.5 and len(self._tape_notes) < 12:
-                for _ in range(random.randint(1, 3)):
+                note['x']    += note['vx']
+                note['phase'] += 0.18
+                note['life']  -= 0.006
+            self._tape_notes = [n for n in self._tape_notes
+                                if n['life'] > 0 and n['x'] < 1.05]
+            # 节拍强拍时生成
+            if self._beat_boost > 1.5 and len(self._tape_notes) < 15:
+                for _ in range(random.randint(2, 4)):
                     self._tape_notes.append({
-                        'x': random.random(),
-                        'y': 0.0,
-                        'vy': -random.uniform(0.6, 2.0),
-                        'life': random.uniform(0.7, 1.0),
+                        'x': random.uniform(0.0, 0.08),
+                        'vx': random.uniform(0.012, 0.030),
+                        'phase': random.uniform(0, 2*math.pi),
+                        'amp':  random.uniform(0.4, 1.1),
+                        'life': random.uniform(0.9, 1.0),
                         'ch': random.choice(note_chars),
-                        'sz': random.uniform(0.7, 1.3),
+                        'color_idx': random.randint(0, 11),
+                        'base_frac': random.uniform(0.15, 0.85),
                     })
             # 播放中偶尔自然生成
-            if playing and self._bar_frame % 10 == 0 and len(self._tape_notes) < 6:
+            if playing and self._bar_frame % 14 == 0 and len(self._tape_notes) < 8:
                 self._tape_notes.append({
-                    'x': random.random(),
-                    'y': 0.0,
-                    'vy': -random.uniform(0.3, 1.2),
+                    'x': random.uniform(0.0, 0.05),
+                    'vx': random.uniform(0.008, 0.020),
+                    'phase': random.uniform(0, 2*math.pi),
+                    'amp':  random.uniform(0.3, 0.9),
                     'life': random.uniform(0.5, 0.8),
                     'ch': random.choice(note_chars),
-                    'sz': random.uniform(0.5, 1.0),
+                    'color_idx': random.randint(0, 11),
+                    'base_frac': random.uniform(0.1, 0.9),
                 })
 
             boost = self._beat_boost
@@ -906,18 +912,35 @@ class CassettePlayer(QWidget):
             hl.quadTo((x0+x1)/2, ctrl_y - lw/2, x1, ly - lw/2)
             p.drawPath(hl)
 
-        # 跳动音符
+        # 跳动音符 — 沿贝塞尔弧线蹦跳，从左侧飘到右侧，散布整个窗口
         if self._tape_notes:
-            nf = QFont("Segoe UI Symbol", max(8, int(11*s)))
+            nf = QFont("Segoe UI Symbol", max(9, int(12*s)))
+            x0_arc   = win_l + pad + x_shift
+            x1_arc   = win_r - pad + x_shift
             for note in self._tape_notes:
-                nx = win_l + note['x'] * win_w
-                ny = win_t - int(6*s) + note['y'] * int(10*s)
-                a  = int(note['life'] * 210)
+                nx  = win_l + note['x'] * win_w
+                # 每个音符有自己的垂直基线，散布在上下弧线之间
+                base_y = win_t + note.get('base_frac', 0.5) * win_h
+                ctrl_y = base_y + self._slack * int(reel_r * 0.18)
+                t  = max(0.0, min(1.0, (nx - x0_arc) / max(1, x1_arc - x0_arc)))
+                arc_y = (1-t)*(1-t)*base_y + 2*(1-t)*t*ctrl_y + t*t*base_y
+                # 蹦跳偏移
+                hop = math.sin(note['phase'] + t * 10) * note['amp'] * win_h * 0.06
+                ny  = arc_y - hop
+                # 莫兰迪色系
+                morandi_colors = [
+                    (185, 150, 145), (155, 170, 150), (145, 155, 175),
+                    (190, 175, 150), (170, 160, 180), (180, 165, 155),
+                    (160, 170, 170), (175, 160, 150), (150, 155, 165),
+                    (195, 180, 170), (165, 175, 160), (170, 150, 155),
+                ]
+                r, g, b = morandi_colors[note.get('color_idx', 0) % len(morandi_colors)]
+                a = int(note['life'] * 220)
+                c = QColor(r, g, b, a)
                 p.setFont(nf)
-                c = QColor(255, 220, 130, a) if note['life'] > 0.3 else QColor(255, 200, 100, a)
                 p.setPen(c)
-                p.drawText(QRectF(nx - int(8*s), ny - int(8*s),
-                                  int(16*s), int(16*s)),
+                p.drawText(QRectF(nx - int(10*s), ny - int(10*s),
+                                  int(20*s), int(20*s)),
                            Qt.AlignmentFlag.AlignCenter, note['ch'])
 
         p.setPen(QPen(QColor(140,130,110,100), max(1,int(1.5*s))))
