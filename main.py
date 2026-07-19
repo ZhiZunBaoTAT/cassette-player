@@ -1,3 +1,4 @@
+
 """
 透明磁带音乐播放器 — Cassette Player  v3.0
 ─────────────────────────────────────────────────────────────
@@ -18,7 +19,7 @@ v3.0 新增：
 
 import sys, os, math, random, threading, io, time
 from pathlib import Path
-
+from PyQt6.QtGui import QPainter, QImage, QPainterPath, QColor
 import numpy as np
 from scipy.fft import rfft
 from pydub import AudioSegment
@@ -27,7 +28,7 @@ from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QFileDialog
 from PyQt6.QtCore    import Qt, QTimer, QRectF, QPointF, QUrl, QSettings, QEasingCurve
 from PyQt6.QtGui     import (QPainter, QColor, QBrush, QPen, QFont,
                               QLinearGradient, QPainterPath,
-                              QPixmap, QImage)
+                              QPixmap, QImage, QBitmap)
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 from mutagen import File as MutagenFile
@@ -337,7 +338,7 @@ class CassettePlayer(QWidget):
 
         # ── 可视化 ──
         self._viz_style       = int(self._settings.value("viz_style", 0))
-        self._viz_erase_pending = False
+        self._viz_erase_pending = False   # 风格切换后首帧跳过绘制，确保干净过渡
 
         # ── 频谱柱 ──
         self._bar_count   = 60
@@ -424,10 +425,9 @@ class CassettePlayer(QWidget):
     def _setup_ui(self):
         self.setMinimumSize(500, 320)
         self.setMouseTracking(True)
-        self.setStyleSheet("background: transparent;")
-        # 与 MainWindow 一致：禁止系统预填充，防止首帧烙印
-        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        self.setStyleSheet("background: transparent;")
         self._btn_play_text = "▶"
         self._btn_regions   = []
         self._btn_hover     = -1
@@ -562,7 +562,9 @@ class CassettePlayer(QWidget):
         target_frac = 1.0 if self._sidebar_open else 0.0
         self._sidebar_frac += (target_frac - self._sidebar_frac) * 0.18
 
-        self.update()
+        # 用 repaint() 代替 update()：同步全量绘制，绕过 Qt 脏区域合并。
+        # update() 在 resize 期间会被合并为部分区域更新，导致旧帧像素残留（残影）。
+        self.repaint()
 
         # ── 帧率自适应 ──
         elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -592,6 +594,9 @@ class CassettePlayer(QWidget):
     # ════════════════════════════════════════════════════════
 
     def paintEvent(self, event):
+        """离屏 QPixmap → 两步 CompositionMode_Source 覆写：
+        1) 先填不透明黑色——阻止 CoreGraphics 因"源和目标皆透明"跳过合成
+        2) 再覆写 pixmap——透明区域恢复透明，机身恢复半透明"""
         w, h = self.width(), self.height()
         s    = w / 680
         mg   = int(18 * s)
@@ -599,97 +604,69 @@ class CassettePlayer(QWidget):
         bw   = w - mg * 2
         bh   = h - mg * 2
 
-        img = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
-        img.fill(0)
+        pix = QPixmap(w, h)
+        pix.fill(Qt.GlobalColor.transparent)
 
-        p = QPainter(img)
+        p = QPainter(pix)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
 
-        # 机身 path
         body = QPainterPath()
         body.addRoundedRect(QRectF(mg, mg, bw, bh), 22, 22)
 
-        # 机身主体
         p.fillPath(body, QColor(55, 60, 72, 115))
-        p.setPen(QPen(QColor(170,180,200,150), 2)); p.drawPath(body)
+        p.setPen(QPen(QColor(170, 180, 200, 150), 2)); p.drawPath(body)
 
-        # 内发光
         p2 = QPainterPath()
-        p2.addRoundedRect(QRectF(mg+3, mg+3, bw-6, bh-6), 20, 20)
-        p.setPen(QPen(QColor(255,255,255,30), 1)); p.drawPath(p2)
+        p2.addRoundedRect(QRectF(mg + 3, mg + 3, bw - 6, bh - 6), 20, 20)
+        p.setPen(QPen(QColor(255, 255, 255, 30), 1)); p.drawPath(p2)
 
-        # 所有后续内容裁剪在机身圆角内（img 上 clip 安全）
         p.save()
         p.setClipPath(body)
 
-        # 四边斜面
         self._draw_bevels(p, mg, cb, bw, bh, s)
-
-        # 磨砂纹理
         self._draw_texture(p, mg, cb, bw, bh, s)
-
-        # 标签区
         self._draw_label(p, w, h, s, mg, cb)
-
-        # 歌词
         self._draw_lyrics(p, w, h, s, mg)
 
-        # 磁带轮区
         reel_r  = int(44 * s)
         reel_y  = self._reel_center_y()
         reel_sp = int(170 * s)
         r1x     = w // 2 - reel_sp
         r2x     = w // 2 + reel_sp
         pos_frac = self.audio.position() / max(self.audio.duration(), 1)
-
-        # 变径：左轮缩小，右轮增大
         l_r = int(reel_r * (1.0 - pos_frac * 0.42))
         r_r = int(reel_r * (0.58 + pos_frac * 0.42))
 
         self._draw_tape_window(p, w, reel_y, reel_r, reel_sp, s, pos_frac)
         self._draw_reel(p, r1x, reel_y, l_r, self._left_angle)
         self._draw_reel(p, r2x, reel_y, r_r, self._right_angle)
-        # 磁头 LED
         self._draw_led(p, s)
-
-        # 控制按钮
         self._draw_buttons(p, w, reel_y, reel_sp, s)
-
-        # 播放模式按钮（在按钮区右侧）
         self._draw_play_mode(p, w, s)
-
-        # 四角螺丝
         self._draw_screws(p, w, mg, cb, s)
-
-        # 音量条
         self._draw_volume_bar(p, w, mg, bh, s)
 
-        # 进度条
         wsx = r1x - reel_r; wex = r2x + reel_r
-        wtw = wex - wsx; wh_ = int(78*s); wbo = int(6*s)
+        wtw = wex - wsx; wh_ = int(78 * s); wbo = int(6 * s)
         base_y = cb - wbo
         self._draw_progress(p, wsx, wex, wtw, base_y, wh_, s, cb)
-
-        # 频谱
         self._draw_spectrum(p, wsx, wex, base_y, wh_, s)
 
-        # 侧边栏（最上层，仍在 clip 区内）
         if self._sidebar_frac > 0.01:
             self._draw_sidebar(p, w, h, s)
 
-        p.restore()   # 结束机身 clip
-        p.end()       # 结束 img QPainter
+        p.restore()
+        p.end()
 
-        # ── 贴到真实透明窗口 ──
-        # CompositionMode_Source：直接覆写像素（含 alpha），
-        # 不与旧内容混合，彻底替换每一帧，无残影无黑块
+        # ── 两步覆写 ──
         real = QPainter(self)
-        real.setCompositionMode(
-            QPainter.CompositionMode.CompositionMode_Source)
-        real.drawImage(0, 0, img)
+        # 第 1 步：填不透明黑，强制 CoreGraphics 确认目标非透明
+        real.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        real.fillRect(self.rect(), QColor(0, 0, 0, 255))
+        # 第 2 步：用 pixmap 覆写（透明像素恢复透明）
+        real.drawPixmap(0, 0, pix)
         real.end()
-
     # ──────────────────────────────────────────────────────────
     #  机身四边斜面高光/阴影
     # ──────────────────────────────────────────────────────────
@@ -1236,12 +1213,20 @@ class CassettePlayer(QWidget):
                           min(255,int((bf+cm)*255)))
 
     def _draw_spectrum(self, p, sx, ex, base_y, max_h, s):
-        self._viz_erase_pending = False
-        # 空风格：什么都不画（启动首帧用，让烙印是空的）
+        # ── 风格切换后首帧：跳过绘制，给状态一个"干净帧"过渡 ──
+        if self._viz_erase_pending:
+            self._viz_erase_pending = False
+            return
+
+        # 空风格：什么都不画
         if self._viz_style < 0:
             return
+
         tw = ex-sx; n = min(60, len(self._bars)); self._bar_count = n
-        self._viz_methods[self._viz_style % 7](p, sx, ex, base_y, max_h, s, n, tw)
+
+        # 【修复】：使用动态长度，防止以后增删方法时越界
+        method_index = self._viz_style % len(self._viz_methods)
+        self._viz_methods[method_index](p, sx, ex, base_y, max_h, s, n, tw)
 
     def _draw_bars(self, p, sx, ex, base_y, max_h, s, n, tw):
         cw = tw/n; bw = max(2.0, cw*0.7)
@@ -1497,6 +1482,11 @@ class CassettePlayer(QWidget):
     def _cycle_viz(self):
         # -1(空) → 0 → 1 → ... → 6 → -1(空)，循环 8 档
         self._viz_style = -1 if self._viz_style >= 6 else self._viz_style + 1
+        # ── 风格切换：重置风格专属状态，防止"残影"（状态残留）──
+        self._viz_erase_pending = True   # 通知下一帧做清理
+        self._particles = []             # 清除粒子位置缓存
+        if hasattr(self, '_ptw'):
+            del self._ptw                # 强制下次重建粒子
         self.update()
 
     def _toggle_mute(self):
@@ -1750,13 +1740,36 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.resize(680, 420); self.setMinimumSize(500, 320)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
-        # WA_TranslucentBackground：允许透明
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        # WA_NoSystemBackground：禁止 Qt/系统预填充背景（消除"烙印"根因）
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
         self.setStyleSheet("background: transparent;")
         self.player = CassettePlayer()
         self.setCentralWidget(self.player)
+        self._updateMask()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._updateMask()
+
+    def _updateMask(self):
+        """创建圆角矩形位图蒙版，裁剪窗口为磁带机身形状"""
+        w, h = self.width(), self.height()
+        if w <= 0 or h <= 0:
+            return
+        s    = w / 680
+        mg   = int(18 * s)
+        bw   = w - mg * 2
+        bh   = h - mg * 2
+
+        bitmap = QBitmap(w, h)
+        bitmap.fill(Qt.GlobalColor.color0)       # 全透明
+        p = QPainter(bitmap)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(Qt.GlobalColor.color1)        # 全不透明
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRoundedRect(mg, mg, bw, bh, 22, 22)
+        p.end()
+        self.setMask(bitmap)
 
 
 def main():
